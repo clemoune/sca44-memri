@@ -1,0 +1,461 @@
+---
+title: "R Notebook for SCA44 mice"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+## Preparing data and libraries
+Load libraries
+
+```{r include = FALSE}
+library(RMINC)
+library(data.tree)
+library(rjson)
+library(MRIcrotome) #for visualisation
+library(ggplot2)
+library(tidyverse)
+library(Hmisc)
+```
+
+
+
+Import data table
+
+```{r}
+#replace with relevant path
+dataDir <- '/well/lerch/users/wwk430/SCA44/'
+inputFile <- file.path(dataDir,'MEMRI_SCA44_BMRC.csv')
+mydataTable <- read.csv(inputFile)
+print(mydataTable)
+```
+Set references, prepare data.
+
+```{r}
+mydataTable$Genotype <- factor(mydataTable$Genotype)
+mydataTable$Genotype <- relevel(mydataTable$Genotype, ref = "WT")
+mydataTable$Sex <- factor(mydataTable$Sex)
+mydataTable$Sex <- relevel(mydataTable$Sex, ref = "M")
+mydataTable$Session <- factor(mydataTable$Session)
+mydataTable$Session <- relevel(mydataTable$Session, ref = "1")
+
+```
+
+
+
+# Atlas based segmentated analysis
+
+Extract the volumetric data from the voted atlases.
+
+```{r}
+defs <- "/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/mappings/Dorr_2008_Steadman_2013_Ullmann_2013_mapping_of_labels.csv"
+
+volsAlltot <- anatGetAll(mydataTable$Atlases, method="labels", defs=defs, side="both")
+dim(volsAlltot)
+```
+
+
+Organise them into a hierarchy.
+
+```{r}
+hdefs <- makeMICeDefsHierachical("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/mappings/Dorr_2008_Steadman_2013_Ullmann_2013_mapping_of_labels.csv", "/well/lerch/shared/tools/atlases/Allen_Brain/Allen_hierarchy_definitions.json")
+
+hvolsAlltot <- addVolumesToHierarchy(hdefs, volsAlltot)
+```
+
+```{r}
+mydataTable$Volumes <- FindNode(hvolsAlltot,"root2")$volumes
+mydataTable$VolumesCentredDemeaned <- (FindNode(hvolsAlltot,"root2")$volumes-mean(FindNode(hvolsAlltot,"root2")$volumes))/FindNode(hvolsAlltot,"root2")$volumes
+```
+
+
+
+## Figure 4A - effect of genotype in the cerebellum
+
+Run the linear mixed effect model with the mouse ID as a random intercept to capture the intra-subject variance.
+Fixed effect = age ("Session"), sex and genotype. 
+
+```{r}
+sca44hanatlmer <- hanatLmer( ~ Session+Sex+Genotype+ VolumesCentredDemeaned + (1|MCMSID), mydataTable, hvolsAlltot)
+```
+
+
+
+
+Check for the interaction between age and genotyoe. 
+
+```{r}
+sca44hanatlmerinter <- hanatLmer(~ Session*Genotype+Sex +VolumesCentredDemeaned + (1|MCMSID), mydataTable, hvolsAlltot)
+```
+
+
+
+
+```{r}
+sca44hanatlmer <- hanatLmerEstimateDF(sca44hanatlmer)
+sca44hanatlmerinter <- hanatLmerEstimateDF(sca44hanatlmerinter)
+```
+
+
+
+Now we will look at the cerebellum only for the stats (reduces the number of multiple comparisons).
+
+```{r}
+sca44hanatlmerCerebellum <- FindNode(sca44hanatlmer, "Cerebellum")
+sca44hanatlmerCerebellum$Set("qvalue.GenotypeHom" =  p.adjust(pt2(ToDataFrameTree(sca44hanatlmerCerebellum, "tvalue.GenotypeHom")[,2], 19), "BH"))
+print(sca44hanatlmerCerebellum, "tvalue.GenotypeHom", "qvalue.GenotypeHom")
+```
+
+q-values < 0.10 (i.e |t-values| >~ 2.40) correspond to a ~10% FDR
+
+
+```{r echo = FALSE}
+anatVol <- mincArray(mincGetVolume("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/in-vivo-MEMRI_90micron/Dorr_2008_Steadman_2013_Ullmann_2013_on_MEMRI_C57BL6_P43_average.mnc"))
+labelVol <- mincArray(mincGetVolume("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/in-vivo-MEMRI_90micron/Dorr_2008_Steadman_2013_Ullmann_2013_on_MEMRI_C57BL6_P43_labels.mnc"))
+
+d <- dim(anatVol)
+d[2] <- 100
+
+anatVol <- anatVol * (labelVol>0)
+anatVol <- anatVol[1:d[1], 1:d[2], 1:d[3]]
+labelVol <- labelVol[1:d[1], 1:d[2], 1:d[3]]
+
+tmpAll <- hanatToVolume(sca44hanatlmerCerebellum, labelVol, "tvalue.GenotypeHom")
+tmpInter<- -log10(hanatToVolume(sca44hanatlmerCerebellum, labelVol, "qvalue.GenotypeHom"))
+tmpInter[is.infinite(tmpInter)] <- NA
+
+#tmpAll <- hanatToVolume(sca44hanatlmer, labelVol, "tvalue.GenotypeHom")
+#tmpInter<- hanatToVolume(sca44hanatlmerinter, labelVol, "tvalue.Session2:GenotypeHom")
+#tmpInter[is.infinite(tmpInter)] <- NA
+
+tmpAll <- tmpAll[1:d[1], 1:d[2], 1:d[3]]
+tmpInter <- tmpInter[1:d[1], 1:d[2], 1:d[3]]
+
+# this colours the volume by the Allen's atlas colours
+atlasCols <- hanatToVolume(hvolsAlltot, labelVol, "color_hex_triplet")
+
+# start a slice series
+#png(filename='/well/lerch/users/wwk430/SCA44/2502SCA44_lmer_neuroanatomy_segmented_cerebellum_corrected.png',units='cm', width=29,height=25,res=150)
+sliceSeries(ncol=1, nrow=9, begin=40, end=120, dimension=1) %>%
+  anatomy(anatVol, low=700, high=1400) %>%  # add background anatomy (blank arguments means take the same as the last anatomy call)
+  overlay(atlasCols, low=1, high=2) %>% # overlay the atlas colours
+  addtitle("Atlas") %>%
+  sliceSeries() %>% # another slice series/column
+  anatomy() %>% # background anatomy
+  overlay(tmpAll, low=2.40, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic 10% FDR") %>% # add a colourbar
+  addtitle("Effect of Genotype") %>%
+  sliceSeries() %>%
+  anatomy() %>% 
+  overlay(tmpInter, low=1, high=2, symmetric = F) %>% # overlay the t-stats map
+  legend("q value") %>% # add a colourbar
+  addtitle("Effect of Genotype - Q") %>%
+  sliceSeries(ncol=1, nrow=8, begin=50, end=75, dimension=2) %>% # another slice series/column
+  anatomy(anatVol, low=700, high=1400) %>%
+  overlay(tmpAll, low=2.40, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic 10% FDR") %>% # add a colourbar
+  addtitle("Effect of Genotype") %>%
+  sliceSeries() %>%
+  anatomy() %>% 
+  overlay(tmpInter, low=1, high=2, symmetric = F) %>% # overlay the t-stats map
+  legend("q value") %>% # add a colourbar
+  addtitle("Effect of Genotype - Q") %>%
+  draw()
+  #dev.off()
+```
+
+```{r echo = FALSE}
+anatVol <- mincArray(mincGetVolume("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/in-vivo-MEMRI_90micron/Dorr_2008_Steadman_2013_Ullmann_2013_on_MEMRI_C57BL6_P43_average.mnc"))
+labelVol <- mincArray(mincGetVolume("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/in-vivo-MEMRI_90micron/Dorr_2008_Steadman_2013_Ullmann_2013_on_MEMRI_C57BL6_P43_labels.mnc"))
+
+d <- dim(anatVol)
+#d[2] <- 100
+
+anatVol <- anatVol * (labelVol>0)
+anatVol <- anatVol[1:d[1], 1:d[2], 1:d[3]]
+labelVol <- labelVol[1:d[1], 1:d[2], 1:d[3]]
+
+#tmpAll <- hanatToVolume(sca44hanatlmerCerebellum, labelVol, "tvalue.GenotypeHom")
+#tmpInter<- -log10(hanatToVolume(sca44hanatlmerCerebellum, labelVol, "qvalue.GenotypeHom"))
+#tmpInter[is.infinite(tmpInter)] <- NA
+
+tmpAll <- hanatToVolume(sca44hanatlmer, labelVol, "tvalue.GenotypeHom")
+tmpInter<- hanatToVolume(sca44hanatlmerinter, labelVol, "tvalue.Session2:GenotypeHom")
+#tmpInter[is.infinite(tmpInter)] <- NA
+
+tmpAll <- tmpAll[1:d[1], 1:d[2], 1:d[3]]
+tmpInter <- tmpInter[1:d[1], 1:d[2], 1:d[3]]
+
+# this colours the volume by the Allen's atlas colours
+atlasCols <- hanatToVolume(hvolsAlltot, labelVol, "color_hex_triplet")
+
+# start a slice series
+#png(filename='/well/lerch/users/wwk430/SCA44/2502SCA44_lmer_neuroanatomy_segmented_corrected_no_FDR_24_genot.png',units='cm', width=35,height=25,res=150)
+sliceSeries(ncol=1, nrow=9, begin=40, end=120, dimension=1) %>%
+  anatomy(anatVol, low=700, high=1400) %>%  # add background anatomy (blank arguments means take the same as the last anatomy call)
+  overlay(atlasCols, low=1, high=2) %>% # overlay the atlas colours
+  addtitle("Atlas") %>%
+sliceSeries() %>% # another slice series/column
+  anatomy() %>% # background anatomy
+  overlay(tmpAll, low=2.4, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic no FDR") %>% # add a colourbar
+  addtitle("Effect of Genotype") %>%
+sliceSeries(ncol=1, nrow=9, begin=50, end=180, dimension=2) %>% # another slice series/column
+  anatomy(anatVol, low=700, high=1400) %>%
+  overlay(tmpAll, low=2.4, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic no FDR") %>% # add a colourbar
+  addtitle("Effect of Genotype") %>%
+sliceSeries(ncol=1, nrow=9, begin=40, end=120, dimension=1) %>% # another slice series/column
+  anatomy(anatVol, low=700, high=1400) %>% # background anatomy
+  overlay(tmpInter, low=3, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic no FDR") %>% # add a colourbar
+  addtitle("Effect of Age*Genotype interaction") %>%
+  sliceSeries(ncol=1, nrow=9, begin=50, end=180, dimension=2) %>% # another slice series/column
+  anatomy(anatVol, low=700, high=1400) %>%
+  overlay(tmpInter, low=3, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic no FDR") %>% # add a colourbar
+  addtitle("Effect of Age*Genotype interaction") %>%
+  draw()
+  #dev.off()
+```
+
+
+
+
+## Figure 4B: volumes for 4 regions.
+
+
+```{r include = FALSE}
+library(ggplot2)
+library(Hmisc)
+library(cowplot)
+```
+
+```{r include = FALSE}
+cbPalette <- c("#FFFFFF", "#008000")
+
+
+TotalVol <- mydataTable %>%
+mutate(TotalVol = FindNode(hvolsAlltot, "root2")$volumes) %>% # then we add the hpc volumes
+ggplot() + # and pass this data to ggplot
+aes(x = Session, # here we define our aesthetics - x, y, and colour
+y = TotalVol,
+fill = Genotype) +
+geom_point(position = position_jitterdodge(), # we add points, and jitter and dodge them for visibility
+alpha=0.7, color="black", shape=21, size=4, aes(fill=factor(Genotype)), show.legend = FALSE) + # as well as make them transparent
+stat_summary(fun.data = mean_cl_boot, # now we add error bars (95% confidence intervals)
+geom = "pointrange",
+position = position_jitterdodge(), color="black", shape=21, size=1, aes(fill=factor(Genotype)), show.legend = FALSE) + # we also dodge them a little
+#stat_summary(fun = mean, # and now we connect the means with lines
+#geom ="line",
+#position = position_jitterdodge()) +
+#scale_colour_brewer(palette = "Dark2")
+scale_fill_manual(values=cbPalette) +
+theme_classic(base_size=14)
+
+plot_grid(TotalVol, labels = "AUTO")
+
+```
+
+
+
+```{r}
+cbPalette <- c("#FFFFFF", "#008000")
+
+Interposednucleus <- mydataTable %>%
+mutate(Interposednucleus = FindNode(hvolsAlltot, "Interposed nucleus")$volumes) %>% # then we add the hpc volumes
+ggplot() + # and pass this data to ggplot
+aes(x = Session, # here we define our aesthetics - x, y, and colour
+y = Interposednucleus,
+colour = Genotype) +
+geom_point(position = position_jitterdodge(), # we add points, and jitter and dodge them for visibility
+alpha=0.7, color="black", shape=21, size=4, aes(fill=Genotype), show.legend = FALSE) + # as well as make them transparent
+stat_summary(fun.data = mean_cl_boot, # now we add error bars (95% confidence intervals)
+geom = "pointrange",
+position = position_jitterdodge(), color="black", shape=21, size=1, aes(fill=Genotype), show.legend = FALSE) + 
+scale_fill_manual(values=cbPalette) +
+theme_classic(base_size=12)
+
+Crus1 <- mydataTable %>%
+mutate(Crus1 = FindNode(hvolsAlltot, "Crus 1")$volumes) %>% # then we add the hpc volumes
+ggplot() + # and pass this data to ggplot
+aes(x = Session, # here we define our aesthetics - x, y, and colour
+y = Crus1,
+colour = Genotype) +
+geom_point(position = position_jitterdodge(), # we add points, and jitter and dodge them for visibility
+alpha=0.7, color="black", shape=21, size=4, aes(fill=Genotype), show.legend = FALSE) + # as well as make them transparent
+stat_summary(fun.data = mean_cl_boot, # now we add error bars (95% confidence intervals)
+geom = "pointrange",
+position = position_jitterdodge(), color="black", shape=21, size=1, aes(fill=Genotype), show.legend = FALSE) + 
+scale_fill_manual(values=cbPalette) +
+theme_classic(base_size=12)
+
+
+Simplelobule <- mydataTable %>%
+mutate(Simplelobule = FindNode(hvolsAlltot, "Simple lobule")$volumes) %>% # then we add the hpc volumes
+ggplot() + # and pass this data to ggplot
+aes(x = Session, # here we define our aesthetics - x, y, and colour
+y = Simplelobule,
+colour = Genotype) +
+geom_point(position = position_jitterdodge(), # we add points, and jitter and dodge them for visibility
+alpha=0.7, color="black", shape=21, size=4, aes(fill=Genotype), show.legend = FALSE) + # as well as make them transparent
+stat_summary(fun.data = mean_cl_boot, # now we add error bars (95% confidence intervals)
+geom = "pointrange",
+position = position_jitterdodge(), color="black", shape=21, size=1, aes(fill=Genotype), show.legend = FALSE) + 
+scale_fill_manual(values=cbPalette) +
+theme_classic(base_size=12)
+
+SimpleLWM <- mydataTable %>%
+mutate(SimpleLWM = FindNode(hvolsAlltot, "simple lobule white matter")$volumes) %>% # then we add the hpc volumes
+ggplot() + # and pass this data to ggplot
+aes(x = Session, # here we define our aesthetics - x, y, and colour
+y = SimpleLWM,
+colour = Genotype) +
+geom_point(position = position_jitterdodge(), # we add points, and jitter and dodge them for visibility
+alpha=0.7, color="black", shape=21, size=4, aes(fill=Genotype), show.legend = FALSE) + # as well as make them transparent
+stat_summary(fun.data = mean_cl_boot, # now we add error bars (95% confidence intervals)
+geom = "pointrange",
+position = position_jitterdodge(), color="black", shape=21, size=1, aes(fill=Genotype), show.legend = FALSE) + 
+scale_fill_manual(values=cbPalette) +
+theme_classic(base_size=12)
+
+#png(filename='2404_SCA44Volumes_corrected2.png',units='cm', width=22,height=15,res=150)
+plot_grid(Interposednucleus, Simplelobule, Crus1,  SimpleLWM, labels = "AUTO")
+#dev.off()
+```
+
+
+
+
+
+
+## Figure 4C: Effect of Genotype at 2.5 months and 6 months separately
+
+```{r}
+mydataTable1 <- mydataTable %>% filter(mydataTable$Session == "1")
+print(mydataTable1)
+
+mydataTable1$Genotype <- factor(mydataTable1$Genotype)
+mydataTable1$Genotype <- relevel(mydataTable1$Genotype, ref = "WT")
+mydataTable1$Sex <- factor(mydataTable1$Sex)
+mydataTable1$Sex <- relevel(mydataTable1$Sex, ref = "M")
+
+mydataTable2 <- mydataTable %>% filter(mydataTable$Session == "2" )
+print(mydataTable2)
+
+mydataTable2$Genotype <- factor(mydataTable2$Genotype)
+mydataTable2$Genotype <- relevel(mydataTable2$Genotype, ref = "WT")
+mydataTable2$Sex <- factor(mydataTable2$Sex)
+mydataTable2$Sex <- relevel(mydataTable2$Sex, ref = "M")
+
+```
+
+```{r}
+defs <- "/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/mappings/Dorr_2008_Steadman_2013_Ullmann_2013_mapping_of_labels.csv"
+
+volsAlltot1 <- anatGetAll(mydataTable1$Atlases, method="labels", defs=defs, side="both")
+dim(volsAlltot1)
+```
+
+```{r}
+hdefs <- makeMICeDefsHierachical("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/mappings/Dorr_2008_Steadman_2013_Ullmann_2013_mapping_of_labels.csv", "/well/lerch/shared/tools/atlases/Allen_Brain/Allen_hierarchy_definitions.json")
+
+hvolsAlltot1 <- addVolumesToHierarchy(hdefs, volsAlltot1)
+```
+
+```{r}
+sca44hanatlm1 <- hanatLm(~ Sex + Genotype, mydataTable1, hvolsAlltot1)
+```
+
+```{r echo = FALSE}
+sca44hanatlm1$fields
+
+qscalm1 <- hanatFDR(sca44hanatlm1)
+thresholds(qscalm1)
+```
+
+
+```{r}
+
+volsAlltot2 <- anatGetAll(mydataTable2$Atlases, method="labels", defs=defs, side="both")
+dim(volsAlltot2)
+```
+
+```{r}
+hdefs <- makeMICeDefsHierachical("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/mappings/Dorr_2008_Steadman_2013_Ullmann_2013_mapping_of_labels.csv", "/well/lerch/shared/tools/atlases/Allen_Brain/Allen_hierarchy_definitions.json")
+
+hvolsAlltot2 <- addVolumesToHierarchy(hdefs, volsAlltot2)
+```
+
+
+```{r}
+sca44hanatlm2 <- hanatLm(~ Sex+Genotype, mydataTable2, hvolsAlltot2)
+```
+
+```{r echo = FALSE}
+sca44hanatlm2$fields
+
+qscalm2 <- hanatFDR(sca44hanatlm2)
+thresholds(qscalm2)
+```
+
+
+```{r echo = FALSE}
+anatVol <- mincArray(mincGetVolume("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/in-vivo-MEMRI_90micron/Dorr_2008_Steadman_2013_Ullmann_2013_on_MEMRI_C57BL6_P43_average.mnc"))
+labelVol <- mincArray(mincGetVolume("/well/lerch/shared/tools/atlases/Dorr_2008_Steadman_2013_Ullmann_2013/in-vivo-MEMRI_90micron/Dorr_2008_Steadman_2013_Ullmann_2013_on_MEMRI_C57BL6_P43_labels.mnc"))
+
+d <- dim(anatVol)
+d[2] <- 100
+
+anatVol <- anatVol * (labelVol>0)
+anatVol <- anatVol[1:d[1], 1:d[2], 1:d[3]]
+labelVol <- labelVol[1:d[1], 1:d[2], 1:d[3]]
+
+tmpSession1 <- hanatToVolume(sca44hanatlm1, labelVol, "tvalue.GenotypeHom")
+tmpSession2 <- hanatToVolume(sca44hanatlm2, labelVol, "tvalue.GenotypeHom")
+
+
+tmpSession1 <- tmpSession1[1:d[1], 1:d[2], 1:d[3]]
+tmpSession2 <- tmpSession2[1:d[1], 1:d[2], 1:d[3]]
+
+# this colours the volume by the Allen's atlas colours
+atlasCols <- hanatToVolume(hvolsAlltot, labelVol, "color_hex_triplet")
+
+# start a slice series
+#png(filename='/users/lerch/wwk430/2502SCA44_lmer_neuroanatomy_segmented_cerebellumP75-P180_corrected.png',units='cm', width=29,height=25,res=150)
+sliceSeries(ncol=1, nrow=9, begin=40, end=120, dimension=1) %>%
+  anatomy(anatVol, low=700, high=1400) %>%  # add background anatomy (blank arguments means take the same as the last anatomy call)
+  overlay(atlasCols, low=1, high=2) %>% # overlay the atlas colours
+  addtitle("Atlas") %>%
+  sliceSeries() %>% # another slice series/column
+  anatomy() %>% # background anatomy
+  overlay(tmpSession1, low=2.4, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic") %>% # add a colourbar
+  addtitle("Effect of Genotype P75") %>%
+  sliceSeries() %>%
+  anatomy() %>% 
+  overlay(tmpSession2,  low=2.4, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic") %>% # add a colourbar
+  addtitle("Effect of Genotype P180") %>%
+  sliceSeries(ncol=1, nrow=8, begin=50, end=75, dimension=2) %>% # another slice series/column
+  anatomy(anatVol, low=700, high=1400) %>%
+  overlay(tmpSession1, low=2.4, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic") %>% # add a colourbar
+  addtitle("Effect of Genotype P75") %>%
+  sliceSeries() %>%
+  anatomy() %>% 
+  overlay(tmpSession2, low=2.4, high=6, symmetric = T) %>% # overlay the t-stats map
+  legend("t-statitic") %>% # add a colourbar
+  addtitle("Effect of Genotype P180") %>%
+  draw()
+ #dev.off()
+```
+
+
+
+
